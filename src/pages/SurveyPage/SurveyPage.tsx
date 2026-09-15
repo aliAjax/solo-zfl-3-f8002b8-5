@@ -14,6 +14,7 @@ import {
 import { useBenchStore } from '@/store/useBenchStore';
 import { useSurveyStore } from '@/store/useSurveyStore';
 import type { BatchStatus, SurveyBatch } from '@/types/survey';
+import { FIELD_LABELS, benchNameOf, formatFieldValue } from '@/utils/survey';
 
 const STATUS_META: Record<BatchStatus, { label: string; className: string }> = {
   pending: { label: '待应用', className: 'bg-ochre/10 text-ochre' },
@@ -36,9 +37,20 @@ function StatusBadge({ status }: { status: BatchStatus }) {
 
 export default function SurveyPage() {
   const navigate = useNavigate();
-  const { initialize: initBench, initialized: benchReady } = useBenchStore();
-  const { batches, journal, initialized, initialize, revokeBatch, deleteBatch, hasApplyEntry, orderBlocker } =
-    useSurveyStore();
+  const { benches, initialize: initBench, initialized: benchReady } = useBenchStore();
+  const {
+    batches,
+    journal,
+    syncConflicts,
+    syncAckedVersion,
+    initialized,
+    initialize,
+    revokeBatch,
+    deleteBatch,
+    hasApplyEntry,
+    orderBlocker,
+    ackSyncConflicts,
+  } = useSurveyStore();
   const [confirmRevoke, setConfirmRevoke] = useState<SurveyBatch | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<SurveyBatch | null>(null);
   const [deleteError, setDeleteError] = useState('');
@@ -50,6 +62,7 @@ export default function SurveyPage() {
 
   const sorted = [...batches].sort((a, b) => a.seq - b.seq);
   const version = journal.length;
+  const visibleConflicts = syncConflicts.filter((c) => c.version > syncAckedVersion);
 
   const counts = {
     pending: batches.filter((b) => b.status === 'pending').length,
@@ -84,6 +97,31 @@ export default function SurveyPage() {
           新建勘测批次
         </button>
       </div>
+
+      {visibleConflicts.length > 0 && (
+        <div className="mb-6 p-4 bg-ochre/10 border border-ochre/30 rounded-xl fade-in">
+          <div className="flex items-start justify-between gap-3 mb-2">
+            <div className="flex items-center gap-1.5 text-sm font-medium text-ochre">
+              <AlertTriangle className="w-4 h-4" />
+              检测到 {visibleConflicts.length} 项跨标签页同字段修改（未静默覆盖，已保留后写入的值）
+            </div>
+            <button
+              onClick={ackSyncConflicts}
+              className="px-3 py-1 text-xs text-ochre hover:bg-ochre/10 rounded-lg transition-colors flex-shrink-0"
+            >
+              知道了
+            </button>
+          </div>
+          <div className="space-y-1">
+            {visibleConflicts.map((c, i) => (
+              <p key={`${c.benchId}-${c.field}-${i}`} className="text-xs text-ink-light pl-5">
+                · {benchNameOf(c.benchId, benches)} · {FIELD_LABELS[c.field] ?? c.field}：保留「
+                {formatFieldValue(c.field, c.keptValue)}」，覆盖了「{formatFieldValue(c.field, c.droppedValue)}」
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
         <div className="paper-texture rounded-xl shadow-paper p-3 text-center">

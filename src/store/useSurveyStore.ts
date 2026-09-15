@@ -70,7 +70,7 @@ interface SurveyActions {
   getPreflight: (batchId: string) => BatchResolution | null;
   applyBatch: (id: string) => { ok: boolean; error?: string };
   revokeBatch: (id: string) => void;
-  refold: () => void;
+  refold: (applyBatchId?: string) => void;
   ackSyncConflicts: () => void;
 }
 
@@ -90,6 +90,13 @@ function nextAt(journal: JournalEntry[]): string {
   const last = journal.length > 0 ? Date.parse(journal[journal.length - 1].at) : 0;
   const base = Number.isNaN(last) ? 0 : last;
   return new Date(Math.max(now, base + 1)).toISOString();
+}
+
+/** 批次用户输入时间的单调递增版本：保证合并时较新的状态一定胜出 */
+function bumpBatchTime(batch: SurveyBatch): string {
+  const prev = Date.parse(batch.updatedAt ?? batch.createdAt);
+  const base = Number.isNaN(prev) ? 0 : prev;
+  return new Date(Math.max(Date.now(), base + 1)).toISOString();
 }
 
 export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => ({
@@ -220,10 +227,11 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
 
   setAdjudication: (batchId, key, side) => {
     get().syncFromStorage();
-    const now = new Date().toISOString();
     set({
       batches: get().batches.map((b) =>
-        b.id === batchId ? { ...b, updatedAt: now, adjudications: { ...b.adjudications, [key]: side } } : b
+        b.id === batchId
+          ? { ...b, updatedAt: bumpBatchTime(b), adjudications: { ...b.adjudications, [key]: side } }
+          : b
       ),
     });
     get().syncFromStorage();
@@ -231,12 +239,11 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
 
   setSkipped: (batchId, key, skip) => {
     get().syncFromStorage();
-    const now = new Date().toISOString();
     set({
       batches: get().batches.map((b) => {
         if (b.id !== batchId) return b;
         const skipped = skip ? [...new Set([...b.skipped, key])] : b.skipped.filter((k) => k !== key);
-        return { ...b, updatedAt: now, skipped };
+        return { ...b, updatedAt: bumpBatchTime(b), skipped };
       }),
     });
     get().syncFromStorage();
@@ -270,8 +277,8 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
     if (batch.status === 'revoked') return { ok: false, error: '批次已撤销，不能再次应用' };
 
     if (get().hasApplyEntry(id)) {
-      // 在应用链中被拦下的批次：裁决/跳过已更新，重放日志重新归位
-      get().refold();
+      // 在应用链中被拦下的批次：裁决/跳过已更新，显式应用后重放日志重新归位
+      get().refold(id);
       const after = get().batches.find((b) => b.id === id);
       if (after?.status === 'applied') return { ok: true };
       return { ok: false, error: '仍有未裁决的冲突或无法应用的条目' };
@@ -289,7 +296,12 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
       set({
         batches: get().batches.map((b) =>
           b.id === id
-            ? { ...b, status: 'blocked' as const, blockReasons: buildBlockReasons(resolution, get().batches) }
+            ? {
+                ...b,
+                updatedAt: bumpBatchTime(b),
+                status: 'blocked' as const,
+                blockReasons: buildBlockReasons(resolution, get().batches),
+              }
             : b
         ),
       });
@@ -314,7 +326,14 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
       journal: [...journal, entry],
       batches: get().batches.map((b) =>
         b.id === id
-          ? { ...b, status: 'applied' as const, appliedAt: now, appliedVersion: journal.length + 1, blockReasons: [] }
+          ? {
+              ...b,
+              updatedAt: bumpBatchTime(b),
+              status: 'applied' as const,
+              appliedAt: now,
+              appliedVersion: journal.length + 1,
+              blockReasons: [],
+            }
           : b
       ),
     });
@@ -348,9 +367,9 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
     get().syncFromStorage();
   },
 
-  refold: () => {
+  refold: (applyBatchId?: string) => {
     const { baseArchive, journal, batches } = get();
-    const { benches, outcomes, collisions } = foldJournal(baseArchive, journal, batches);
+    const { benches, outcomes, collisions } = foldJournal(baseArchive, journal, batches, applyBatchId);
 
     const revokedIds = new Set(
       journal.filter((e) => e.type === 'revoke').map((e) => (e as { batchId: string }).batchId)

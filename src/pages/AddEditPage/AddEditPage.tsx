@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -10,6 +10,7 @@ import {
   Sunset,
   Moon,
   CloudSun,
+  AlertTriangle,
 } from 'lucide-react';
 import { useBenchStore } from '@/store/useBenchStore';
 import {
@@ -28,7 +29,10 @@ import type {
   StayDurationType,
   TimePeriodType,
   BenchExperience,
+  Bench,
 } from '@/types';
+import type { FieldDivergence } from '@/types/survey';
+import { FIELD_LABELS, formatFieldValue } from '@/utils/survey';
 import Rating from '@/components/Rating/Rating';
 import { generateId } from '@/utils/comfort';
 
@@ -56,6 +60,11 @@ export default function AddEditPage() {
   });
 
   const [experiences, setExperiences] = useState<BenchExperience[]>([]);
+  /** 表单加载时用户所见的基准快照，用于提交前检出跨标签页同字段分叉 */
+  const [baseSnapshot, setBaseSnapshot] = useState<Bench | null>(null);
+  const [divergences, setDivergences] = useState<FieldDivergence[] | null>(null);
+  /** 每个档案只加载一次表单，避免后台同步冲刷编辑中的内容 */
+  const loadedForRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!initialized) {
@@ -64,7 +73,8 @@ export default function AddEditPage() {
   }, [initialized, initialize]);
 
   useEffect(() => {
-    if (isEdit && existingBench && initialized) {
+    if (isEdit && existingBench && initialized && loadedForRef.current !== id) {
+      loadedForRef.current = id ?? null;
       setFormData({
         name: existingBench.name,
         location: existingBench.location,
@@ -80,8 +90,9 @@ export default function AddEditPage() {
         review: existingBench.review,
       });
       setExperiences(existingBench.experiences || []);
+      setBaseSnapshot(existingBench);
     }
-  }, [isEdit, existingBench, initialized]);
+  }, [isEdit, existingBench, initialized, id]);
 
   const handleChange = (field: string, value: string | number | boolean) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
@@ -113,9 +124,20 @@ export default function AddEditPage() {
     }
   };
 
+  const writeExperiences = (benchId: string) => {
+    experiences.forEach((exp) => {
+      const existingExp = getBenchById(benchId)?.experiences.find((e) => e.id === exp.id);
+      if (existingExp) {
+        updateExperience(benchId, exp.id, exp);
+      } else {
+        addExperience(benchId, exp);
+      }
+    });
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     if (!formData.name.trim()) {
       alert('请输入长椅名称');
       return;
@@ -126,15 +148,14 @@ export default function AddEditPage() {
     }
 
     if (isEdit && id) {
-      updateBench(id, formData);
-      experiences.forEach((exp) => {
-        const existingExp = existingBench?.experiences.find((e) => e.id === exp.id);
-        if (existingExp) {
-          updateExperience(id, exp.id, exp);
-        } else {
-          addExperience(id, exp);
-        }
-      });
+      // 写入前检出跨标签页同字段分叉：被拦下则不写入任何数据
+      const result = updateBench(id, formData, { base: baseSnapshot });
+      if (!result.ok) {
+        setDivergences(result.conflicts ?? []);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+      writeExperiences(id);
     } else {
       addBench({
         ...formData,
@@ -142,6 +163,49 @@ export default function AddEditPage() {
     }
 
     navigate(-1);
+  };
+
+  /** 人工裁决后强制提交：onlyCleanFields 为 true 时保留他人改动的字段，仅写入未分叉字段 */
+  const handleForceSubmit = (onlyCleanFields: boolean) => {
+    if (!id) return;
+    const data: Record<string, unknown> = { ...formData };
+    if (onlyCleanFields && divergences) {
+      divergences.forEach((d) => {
+        delete data[d.field];
+      });
+    }
+    const result = updateBench(id, data, { base: baseSnapshot, force: true });
+    if (result.ok) {
+      writeExperiences(id);
+      setDivergences(null);
+      navigate(-1);
+    }
+  };
+
+  /** 放弃本次修改：表单重置为档案当前值 */
+  const handleDiscard = () => {
+    if (id) {
+      const fresh = getBenchById(id);
+      if (fresh) {
+        setFormData({
+          name: fresh.name,
+          location: fresh.location,
+          lat: fresh.lat,
+          lng: fresh.lng,
+          material: fresh.material,
+          orientation: fresh.orientation,
+          hasBackrest: fresh.hasBackrest,
+          shadeLevel: fresh.shadeLevel,
+          noiseLevel: fresh.noiseLevel,
+          stayDuration: fresh.stayDuration,
+          rating: fresh.rating,
+          review: fresh.review,
+        });
+        setExperiences(fresh.experiences || []);
+        setBaseSnapshot(fresh);
+      }
+    }
+    setDivergences(null);
   };
 
   const timePeriodIcons: Record<TimePeriodType, typeof Sunrise> = {
@@ -399,7 +463,7 @@ export default function AddEditPage() {
 
             {experiences.length > 0 ? (
               <div className="space-y-4">
-                {experiences.map((exp, index) => {
+                {experiences.map((exp) => {
                   const TimeIcon = timePeriodIcons[exp.timePeriod];
                   return (
                     <div
@@ -493,6 +557,69 @@ export default function AddEditPage() {
           </div>
         </form>
       </div>
+
+      {divergences && divergences.length > 0 && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="paper-texture rounded-xl shadow-paper-hover p-6 max-w-lg w-full fade-in max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle className="w-5 h-5 text-ochre" />
+              <h3 className="font-serif text-lg font-semibold text-deep-brown">
+                检测到同字段并发修改，已拦下本次写入
+              </h3>
+            </div>
+            <p className="text-ink-light text-sm mb-4 leading-relaxed">
+              另一标签页已修改了「{existingBench?.name ?? '该长椅'}」的同一字段。你的修改尚未写入，未覆盖任何数据。请核对后选择处理方式：
+            </p>
+
+            <div className="space-y-3 mb-5">
+              {divergences.map((d) => (
+                <div key={d.field} className="p-3 bg-ochre/5 border border-ochre/20 rounded-lg">
+                  <p className="text-sm font-medium text-deep-brown mb-2">
+                    {FIELD_LABELS[d.field] ?? d.field}
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div className="p-2 bg-warm-beige/60 rounded-md">
+                      <div className="text-[10px] text-ink-light/70 mb-0.5">你看到的</div>
+                      <div className="text-ink-light break-words">{formatFieldValue(d.field, d.baseValue)}</div>
+                    </div>
+                    <div className="p-2 bg-moss-green/10 rounded-md">
+                      <div className="text-[10px] text-ink-light/70 mb-0.5">档案当前（保留）</div>
+                      <div className="text-deep-brown break-words">{formatFieldValue(d.field, d.currentValue)}</div>
+                    </div>
+                    <div className="p-2 bg-red-500/5 rounded-md">
+                      <div className="text-[10px] text-ink-light/70 mb-0.5">你提交的（被拦下）</div>
+                      <div className="text-deep-brown break-words">{formatFieldValue(d.field, d.incomingValue)}</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="space-y-2">
+              {divergences.length < Object.keys(formData).length && (
+                <button
+                  onClick={() => handleForceSubmit(true)}
+                  className="w-full px-4 py-2.5 text-sm text-white bg-moss-green hover:bg-moss-light rounded-lg transition-colors"
+                >
+                  保留他人改动，提交其余字段
+                </button>
+              )}
+              <button
+                onClick={() => handleForceSubmit(false)}
+                className="w-full px-4 py-2.5 text-sm text-white bg-ochre hover:bg-ochre-light rounded-lg transition-colors"
+              >
+                仍要全部覆盖（以我的提交为准）
+              </button>
+              <button
+                onClick={handleDiscard}
+                className="w-full px-4 py-2.5 text-sm text-deep-brown bg-warm-beige hover:bg-warm-beige/80 rounded-lg transition-colors"
+              >
+                放弃本次修改，载入最新档案
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

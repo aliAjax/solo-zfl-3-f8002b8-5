@@ -133,3 +133,15 @@ export interface SyncConflict {
   /** 所在日志条目的版本号 */
   version: number;
 }
+
+/** 写入前检出的同字段并发分叉（另一侧已改动该字段，本次写入被拦下） */
+export interface FieldDivergence {
+  benchId: string;
+  field: string;
+  /** 当前用户看到的基准值 */
+  baseValue: unknown;
+  /** 档案当前值（另一侧已写入，保留） */
+  currentValue: unknown;
+  /** 当前用户提交的值（被拦下，未写入） */
+  incomingValue: unknown;
+}

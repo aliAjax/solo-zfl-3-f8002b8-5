@@ -397,11 +397,14 @@ export function buildBlockReasons(resolution: BatchResolutionT, batches: SurveyB
     });
 }
 
-/** 重放整个日志，返回最终档案与各批次的应用结果 */
+/** 重放整个日志，返回最终档案与各批次的应用结果。
+ *  被拦下的批次保持拦下状态（不因其变为可解而自动归位），
+ *  只有 applyBatchId 指定的批次（用户显式点击应用）才会在本次重放中归位。 */
 export function foldJournal(
   base: Bench[],
   journal: import('@/types/survey').JournalEntry[],
-  batches: SurveyBatch[]
+  batches: SurveyBatch[],
+  applyBatchId?: string
 ): FoldResult {
   let state = cloneBenches(base);
   // 撤销是对整个历史生效的：先收集所有被撤销的批次，再从头折叠
@@ -445,7 +448,8 @@ export function foldJournal(
       const batch = batches.find((b) => b.id === entry.batchId);
       if (!batch) continue;
       const resolution = resolveBatch(batch, state);
-      if (resolution.canApply) {
+      const stickyBlocked = batch.status === 'blocked' && batch.id !== applyBatchId;
+      if (!stickyBlocked && resolution.canApply) {
         state = applyResolved(state, resolution);
         outcomes.set(batch.id, { status: 'applied', reasons: [] });
       } else {
@@ -480,6 +484,8 @@ export function stateBeforeBatch(
       if (excluded.has(entry.batchId)) continue;
       const batch = batches.find((b) => b.id === entry.batchId);
       if (!batch) continue;
+      // 被拦下的批次保持拦下，不参与状态计算
+      if (batch.status === 'blocked') continue;
       const resolution = resolveBatch(batch, state);
       if (resolution.canApply) {
         state = applyResolved(state, resolution);
