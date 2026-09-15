@@ -87,6 +87,8 @@ export interface SurveyBatch {
   surveyor: string;
   note: string;
   createdAt: string;
+  /** 最近一次用户输入（裁决/跳过/编辑）时间，用于跨标签页合并 */
+  updatedAt?: string;
   /** 勘测所基于的档案版本 */
   baseVersion: number;
   status: BatchStatus;
@@ -108,11 +110,26 @@ export interface SurveyBatch {
 export type DirectOp =
   | { kind: 'addBench'; bench: Bench }
   | { kind: 'removeBench'; benchId: string }
-  | { kind: 'setFields'; benchId: string; fields: Record<string, unknown> }
+  | { kind: 'setFields'; benchId: string; fields: Record<string, unknown>; base?: Record<string, unknown> }
   | { kind: 'setExperiences'; benchId: string; experiences: BenchExperience[]; updatedAt?: string };
 
-/** 档案变更日志：版本号 = 条目序号（从 1 开始），追加式 */
+/** 档案变更日志：追加式；id 全局唯一，版本号 = 合并后的条目序号（从 1 开始） */
 export type JournalEntry =
-  | { type: 'direct'; version: number; at: string; ops: DirectOp[] }
-  | { type: 'apply'; version: number; at: string; batchId: string }
-  | { type: 'revoke'; version: number; at: string; batchId: string };
+  | { id: string; type: 'direct'; version: number; at: string; ops: DirectOp[] }
+  | { id: string; type: 'apply'; version: number; at: string; batchId: string }
+  | { id: string; type: 'revoke'; version: number; at: string; batchId: string };
+
+/** 跨标签页同字段编辑冲突（重放日志时检出，不静默覆盖） */
+export interface SyncConflict {
+  benchId: string;
+  field: string;
+  /** 后写入一侧看到的基准值 */
+  baseValue: unknown;
+  /** 被覆盖的值（先写入一侧） */
+  droppedValue: unknown;
+  /** 保留的值（后写入一侧） */
+  keptValue: unknown;
+  at: string;
+  /** 所在日志条目的版本号 */
+  version: number;
+}

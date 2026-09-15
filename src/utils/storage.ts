@@ -16,7 +16,11 @@ export function loadBenches(): Bench[] {
 
 export function saveBenches(benches: Bench[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(benches));
+    const value = JSON.stringify(benches);
+    // 仅在内容变化时写入，避免多标签页之间互相触发无效同步事件
+    if (localStorage.getItem(STORAGE_KEY) !== value) {
+      localStorage.setItem(STORAGE_KEY, value);
+    }
   } catch (error) {
     console.error('Failed to save benches to localStorage:', error);
   }

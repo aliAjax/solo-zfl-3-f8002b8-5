@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { Bench } from '@/types';
-import type { DirectOp, JournalEntry, SurveyBatch } from '@/types/survey';
+import type { DirectOp, JournalEntry, SurveyBatch, SyncConflict } from '@/types/survey';
 import {
   loadSurveyBase,
   saveSurveyBase,
@@ -8,6 +8,11 @@ import {
   saveJournal,
   loadBatches,
   saveBatches,
+  loadTombstones,
+  saveTombstones,
+  loadSyncAck,
+  saveSyncAck,
+  SURVEY_STORAGE_KEYS,
 } from '@/utils/surveyStorage';
 import { saveBenches } from '@/utils/storage';
 import {
@@ -15,6 +20,8 @@ import {
   buildBlockReasons,
   cloneBenches,
   foldJournal,
+  mergeBatches,
+  mergeJournals,
   resolveBatch,
   stateBeforeBatch,
 } from '@/utils/survey';
@@ -38,11 +45,19 @@ interface SurveyState {
   journal: JournalEntry[];
   batches: SurveyBatch[];
   initialized: boolean;
+  /** 重放时检出的跨标签页同字段编辑冲突 */
+  syncConflicts: SyncConflict[];
+  /** 冲突警示已读到的档案版本 */
+  syncAckedVersion: number;
+  syncListening: boolean;
 }
 
 interface SurveyActions {
   initialize: () => void;
   currentVersion: () => number;
+  /** 与 localStorage 双向合并：本地未持久化的变更并入存储，存储中另一侧的变更并入本地 */
+  syncFromStorage: () => void;
+  startSyncListener: () => void;
   recordDirectOps: (ops: DirectOp[]) => void;
   createBatch: (input: CreateBatchInput) => SurveyBatch;
   deleteBatch: (id: string) => { ok: boolean; error?: string };
@@ -56,6 +71,7 @@ interface SurveyActions {
   applyBatch: (id: string) => { ok: boolean; error?: string };
   revokeBatch: (id: string) => void;
   refold: () => void;
+  ackSyncConflicts: () => void;
 }
 
 const initialState: SurveyState = {
@@ -63,10 +79,17 @@ const initialState: SurveyState = {
   journal: [],
   batches: [],
   initialized: false,
+  syncConflicts: [],
+  syncAckedVersion: 0,
+  syncListening: false,
 };
 
-function persistBatches(batches: SurveyBatch[]) {
-  saveBatches(batches);
+/** 单调递增的时间戳：保证同一标签页内日志条目的因果顺序 */
+function nextAt(journal: JournalEntry[]): string {
+  const now = Date.now();
+  const last = journal.length > 0 ? Date.parse(journal[journal.length - 1].at) : 0;
+  const base = Number.isNaN(last) ? 0 : last;
+  return new Date(Math.max(now, base + 1)).toISOString();
 }
 
 export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => ({
@@ -76,30 +99,85 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
     if (get().initialized) return;
     const base = loadSurveyBase();
     if (base) {
-      set({ baseArchive: base, journal: loadJournal(), batches: loadBatches(), initialized: true });
+      set({
+        baseArchive: base,
+        journal: mergeJournals(loadJournal()),
+        batches: mergeBatches(loadBatches(), [], loadTombstones()),
+        syncAckedVersion: loadSyncAck(),
+        initialized: true,
+      });
     } else {
       // 首次启用：以当前档案为基准版本 v0
       const seeded = cloneBenches(useBenchStore.getState().benches);
-      set({ baseArchive: seeded, journal: [], batches: [], initialized: true });
+      set({
+        baseArchive: seeded,
+        journal: [],
+        batches: [],
+        syncAckedVersion: loadSyncAck(),
+        initialized: true,
+      });
       saveSurveyBase(seeded);
       saveJournal([]);
       saveBatches([]);
     }
+    // 以日志为准重放一次，自愈可能不一致的物化档案
+    get().refold();
+    get().startSyncListener();
   },
 
   currentVersion: () => get().journal.length,
 
+  syncFromStorage: () => {
+    if (!get().initialized) return;
+    const remoteBase = loadSurveyBase();
+    const remoteJournal = loadJournal();
+    const remoteBatches = loadBatches();
+    const tombstones = loadTombstones();
+    const local = get();
+
+    const mergedBase = local.baseArchive.length > 0 ? local.baseArchive : (remoteBase ?? []);
+    const mergedJournal = mergeJournals(local.journal, remoteJournal);
+    const mergedBatches = mergeBatches(local.batches, remoteBatches, tombstones);
+
+    set({ baseArchive: mergedBase, journal: mergedJournal, batches: mergedBatches });
+    saveSurveyBase(mergedBase);
+    saveJournal(mergedJournal);
+    saveBatches(mergedBatches);
+
+    // 合并后重放：档案版本连续，冲突与依赖按顺序和三方比对规则重新判定
+    get().refold();
+  },
+
+  startSyncListener: () => {
+    if (get().syncListening || typeof window === 'undefined') return;
+    set({ syncListening: true });
+    window.addEventListener('storage', (e) => {
+      if (e.key && !SURVEY_STORAGE_KEYS.includes(e.key) && e.key !== 'bench-archive-data') return;
+      get().syncFromStorage();
+    });
+    window.addEventListener('focus', () => get().syncFromStorage());
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') get().syncFromStorage();
+    });
+  },
+
   recordDirectOps: (ops) => {
     if (!get().initialized || ops.length === 0) return;
-    const journal: JournalEntry[] = [
-      ...get().journal,
-      { type: 'direct', version: get().journal.length + 1, at: new Date().toISOString(), ops },
-    ];
-    set({ journal });
-    saveJournal(journal);
+    const journal = get().journal;
+    const entry: JournalEntry = {
+      id: generateId(),
+      type: 'direct',
+      version: journal.length + 1,
+      at: nextAt(journal),
+      ops,
+    };
+    set({ journal: [...journal, entry] });
+    get().syncFromStorage();
   },
 
   createBatch: (input) => {
+    get().syncFromStorage();
+    const now = new Date().toISOString();
     const seq = Math.max(0, ...get().batches.map((b) => b.seq)) + 1;
     const batch: SurveyBatch = {
       id: generateId(),
@@ -107,7 +185,8 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
       title: input.title,
       surveyor: input.surveyor,
       note: input.note,
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
       baseVersion: get().journal.length,
       status: 'pending',
       adds: input.adds,
@@ -118,41 +197,49 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
       skipped: [],
       blockReasons: [],
     };
-    const batches = [...get().batches, batch];
-    set({ batches });
-    persistBatches(batches);
-    return batch;
+    set({ batches: [...get().batches, batch] });
+    get().syncFromStorage();
+    return get().batches.find((b) => b.id === batch.id) ?? batch;
   },
 
   deleteBatch: (id) => {
+    get().syncFromStorage();
     const batch = get().batches.find((b) => b.id === id);
     if (!batch) return { ok: false, error: '批次不存在' };
     const inChain = get().journal.some((e) => e.type === 'apply' && e.batchId === id);
     if (batch.status === 'applied' || (inChain && batch.status !== 'revoked')) {
       return { ok: false, error: '该批次已进入应用链，请先撤销' };
     }
-    const batches = get().batches.filter((b) => b.id !== id);
-    set({ batches });
-    persistBatches(batches);
+    // 墓碑机制：防止合并时该批次从另一侧复活
+    const tombstones = [...new Set([...loadTombstones(), id])];
+    saveTombstones(tombstones);
+    set({ batches: get().batches.filter((b) => b.id !== id) });
+    get().syncFromStorage();
     return { ok: true };
   },
 
   setAdjudication: (batchId, key, side) => {
-    const batches = get().batches.map((b) =>
-      b.id === batchId ? { ...b, adjudications: { ...b.adjudications, [key]: side } } : b
-    );
-    set({ batches });
-    persistBatches(batches);
+    get().syncFromStorage();
+    const now = new Date().toISOString();
+    set({
+      batches: get().batches.map((b) =>
+        b.id === batchId ? { ...b, updatedAt: now, adjudications: { ...b.adjudications, [key]: side } } : b
+      ),
+    });
+    get().syncFromStorage();
   },
 
   setSkipped: (batchId, key, skip) => {
-    const batches = get().batches.map((b) => {
-      if (b.id !== batchId) return b;
-      const skipped = skip ? [...new Set([...b.skipped, key])] : b.skipped.filter((k) => k !== key);
-      return { ...b, skipped };
+    get().syncFromStorage();
+    const now = new Date().toISOString();
+    set({
+      batches: get().batches.map((b) => {
+        if (b.id !== batchId) return b;
+        const skipped = skip ? [...new Set([...b.skipped, key])] : b.skipped.filter((k) => k !== key);
+        return { ...b, updatedAt: now, skipped };
+      }),
     });
-    set({ batches });
-    persistBatches(batches);
+    get().syncFromStorage();
   },
 
   getBatchById: (id) => get().batches.find((b) => b.id === id),
@@ -176,6 +263,7 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
   },
 
   applyBatch: (id) => {
+    get().syncFromStorage();
     const batch = get().batches.find((b) => b.id === id);
     if (!batch) return { ok: false, error: '批次不存在' };
     if (batch.status === 'applied') return { ok: false, error: '批次已应用' };
@@ -197,13 +285,15 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
     const live = useBenchStore.getState().benches;
     const resolution = resolveBatch(batch, live);
     if (!resolution.canApply) {
-      const batches = get().batches.map((b) =>
-        b.id === id
-          ? { ...b, status: 'blocked' as const, blockReasons: buildBlockReasons(resolution, get().batches) }
-          : b
-      );
-      set({ batches });
-      persistBatches(batches);
+      // 真冲突未裁决或存在无法应用的条目：拦下并说明
+      set({
+        batches: get().batches.map((b) =>
+          b.id === id
+            ? { ...b, status: 'blocked' as const, blockReasons: buildBlockReasons(resolution, get().batches) }
+            : b
+        ),
+      });
+      get().syncFromStorage();
       return { ok: false, error: '存在未裁决的冲突或无法应用的条目，已拦下该批次' };
     }
 
@@ -212,49 +302,69 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
     saveBenches(newBenches);
 
     const now = new Date().toISOString();
-    const journal: JournalEntry[] = [
-      ...get().journal,
-      { type: 'apply', version: get().journal.length + 1, at: now, batchId: id },
-    ];
-    const batches = get().batches.map((b) =>
-      b.id === id
-        ? { ...b, status: 'applied' as const, appliedAt: now, appliedVersion: journal.length, blockReasons: [] }
-        : b
-    );
-    set({ journal, batches });
-    saveJournal(journal);
-    persistBatches(batches);
+    const journal = get().journal;
+    const entry: JournalEntry = {
+      id: generateId(),
+      type: 'apply',
+      version: journal.length + 1,
+      at: nextAt(journal),
+      batchId: id,
+    };
+    set({
+      journal: [...journal, entry],
+      batches: get().batches.map((b) =>
+        b.id === id
+          ? { ...b, status: 'applied' as const, appliedAt: now, appliedVersion: journal.length + 1, blockReasons: [] }
+          : b
+      ),
+    });
+    get().syncFromStorage();
     return { ok: true };
   },
 
   revokeBatch: (id) => {
+    get().syncFromStorage();
     const batch = get().batches.find((b) => b.id === id);
     if (!batch) return;
-    const inChain = get().hasApplyEntry(id);
+    const inChain = get().journal.some((e) => e.type === 'apply' && e.batchId === id);
     if (batch.status !== 'applied' && !(batch.status === 'blocked' && inChain)) return;
 
     const now = new Date().toISOString();
-    const journal: JournalEntry[] = [
-      ...get().journal,
-      { type: 'revoke', version: get().journal.length + 1, at: now, batchId: id },
-    ];
-    const batches = get().batches.map((b) =>
-      b.id === id ? { ...b, status: 'revoked' as const, revokedAt: now, blockReasons: [] } : b
-    );
-    set({ journal, batches });
-    saveJournal(journal);
-    persistBatches(batches);
-
+    const journal = get().journal;
+    const entry: JournalEntry = {
+      id: generateId(),
+      type: 'revoke',
+      version: journal.length + 1,
+      at: nextAt(journal),
+      batchId: id,
+    };
+    set({
+      journal: [...journal, entry],
+      batches: get().batches.map((b) =>
+        b.id === id ? { ...b, status: 'revoked' as const, revokedAt: now, blockReasons: [] } : b
+      ),
+    });
     // 撤销后重放：不依赖它的批次自动重放，依赖同一字段的批次拦下并指出依赖
-    get().refold();
+    get().syncFromStorage();
   },
 
   refold: () => {
     const { baseArchive, journal, batches } = get();
-    const { benches, outcomes } = foldJournal(baseArchive, journal, batches);
+    const { benches, outcomes, collisions } = foldJournal(baseArchive, journal, batches);
 
+    const revokedIds = new Set(
+      journal.filter((e) => e.type === 'revoke').map((e) => (e as { batchId: string }).batchId)
+    );
     const newBatches = batches.map((b) => {
-      if (b.status === 'revoked') return b;
+      if (revokedIds.has(b.id)) {
+        const revokeEntry = [...journal].reverse().find((e) => e.type === 'revoke' && e.batchId === b.id);
+        return {
+          ...b,
+          status: 'revoked' as const,
+          revokedAt: b.revokedAt ?? revokeEntry?.at,
+          blockReasons: [],
+        };
+      }
       const outcome = outcomes.get(b.id);
       if (!outcome) return b;
       if (outcome.status === 'applied') {
@@ -264,15 +374,22 @@ export const useSurveyStore = create<SurveyState & SurveyActions>((set, get) => 
           status: 'applied' as const,
           blockReasons: [],
           appliedVersion: applyEntry?.version ?? b.appliedVersion,
+          appliedAt: b.appliedAt ?? applyEntry?.at,
         };
       }
       return { ...b, status: 'blocked' as const, blockReasons: outcome.reasons };
     });
 
-    set({ batches: newBatches });
-    persistBatches(newBatches);
+    set({ batches: newBatches, syncConflicts: collisions });
+    saveBatches(newBatches);
 
     useBenchStore.setState({ benches });
     saveBenches(benches);
+  },
+
+  ackSyncConflicts: () => {
+    const version = get().journal.length;
+    set({ syncAckedVersion: version });
+    saveSyncAck(version);
   },
 }));

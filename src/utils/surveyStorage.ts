@@ -4,57 +4,70 @@ import type { JournalEntry, SurveyBatch } from '@/types/survey';
 const BASE_KEY = 'bench-survey-base';
 const JOURNAL_KEY = 'bench-survey-journal';
 const BATCHES_KEY = 'bench-survey-batches';
+const TOMBSTONES_KEY = 'bench-survey-tombstones';
+const SYNC_ACK_KEY = 'bench-survey-sync-ack';
+
+export const SURVEY_STORAGE_KEYS = [BASE_KEY, JOURNAL_KEY, BATCHES_KEY, TOMBSTONES_KEY];
+
+/** 仅在内容变化时写入，避免多标签页之间互相触发无效同步事件 */
+function writeKey(key: string, value: string): void {
+  try {
+    if (localStorage.getItem(key) !== value) {
+      localStorage.setItem(key, value);
+    }
+  } catch (error) {
+    console.error('Failed to save survey data to localStorage:', error);
+  }
+}
+
+function readJson<T>(key: string, fallback: T): T {
+  try {
+    const data = localStorage.getItem(key);
+    return data ? (JSON.parse(data) as T) : fallback;
+  } catch (error) {
+    console.error('Failed to load survey data from localStorage:', error);
+    return fallback;
+  }
+}
 
 export function loadSurveyBase(): Bench[] | null {
-  try {
-    const data = localStorage.getItem(BASE_KEY);
-    return data ? (JSON.parse(data) as Bench[]) : null;
-  } catch (error) {
-    console.error('Failed to load survey base from localStorage:', error);
-    return null;
-  }
+  return readJson<Bench[] | null>(BASE_KEY, null);
 }
 
 export function saveSurveyBase(base: Bench[]): void {
-  try {
-    localStorage.setItem(BASE_KEY, JSON.stringify(base));
-  } catch (error) {
-    console.error('Failed to save survey base to localStorage:', error);
-  }
+  writeKey(BASE_KEY, JSON.stringify(base));
 }
 
 export function loadJournal(): JournalEntry[] {
-  try {
-    const data = localStorage.getItem(JOURNAL_KEY);
-    return data ? (JSON.parse(data) as JournalEntry[]) : [];
-  } catch (error) {
-    console.error('Failed to load survey journal from localStorage:', error);
-    return [];
-  }
+  return readJson<JournalEntry[]>(JOURNAL_KEY, []);
 }
 
 export function saveJournal(journal: JournalEntry[]): void {
-  try {
-    localStorage.setItem(JOURNAL_KEY, JSON.stringify(journal));
-  } catch (error) {
-    console.error('Failed to save survey journal to localStorage:', error);
-  }
+  writeKey(JOURNAL_KEY, JSON.stringify(journal));
 }
 
 export function loadBatches(): SurveyBatch[] {
-  try {
-    const data = localStorage.getItem(BATCHES_KEY);
-    return data ? (JSON.parse(data) as SurveyBatch[]) : [];
-  } catch (error) {
-    console.error('Failed to load survey batches from localStorage:', error);
-    return [];
-  }
+  return readJson<SurveyBatch[]>(BATCHES_KEY, []);
 }
 
 export function saveBatches(batches: SurveyBatch[]): void {
-  try {
-    localStorage.setItem(BATCHES_KEY, JSON.stringify(batches));
-  } catch (error) {
-    console.error('Failed to save survey batches to localStorage:', error);
-  }
+  writeKey(BATCHES_KEY, JSON.stringify(batches));
+}
+
+/** 已删除批次的墓碑：防止合并时从另一侧复活 */
+export function loadTombstones(): string[] {
+  return readJson<string[]>(TOMBSTONES_KEY, []);
+}
+
+export function saveTombstones(ids: string[]): void {
+  writeKey(TOMBSTONES_KEY, JSON.stringify(ids));
+}
+
+/** 跨标签页冲突的已读版本位 */
+export function loadSyncAck(): number {
+  return readJson<number>(SYNC_ACK_KEY, 0);
+}
+
+export function saveSyncAck(version: number): void {
+  writeKey(SYNC_ACK_KEY, JSON.stringify(version));
 }

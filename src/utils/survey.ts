@@ -357,6 +357,8 @@ export interface FoldOutcome {
 export interface FoldResult {
   benches: Bench[];
   outcomes: Map<string, FoldOutcome>;
+  /** 重放时检出的跨标签页同字段编辑冲突 */
+  collisions: import('@/types/survey').SyncConflict[];
 }
 
 /** 查找导致某变更键被拦下的已撤销批次（依赖同一字段或同一长椅） */
@@ -408,9 +410,33 @@ export function foldJournal(
   );
   batches.filter((b) => b.status === 'revoked').forEach((b) => excluded.add(b.id));
   const outcomes = new Map<string, FoldOutcome>();
+  const collisions: import('@/types/survey').SyncConflict[] = [];
 
   for (const entry of journal) {
     if (entry.type === 'direct') {
+      // 直改冲突检测：操作记录的基准值与重放时的当前值分叉，说明另一侧也改了同一字段
+      for (const op of entry.ops) {
+        if (op.kind !== 'setFields' || !op.base) continue;
+        const bench = state.find((b) => b.id === op.benchId);
+        if (!bench) continue;
+        for (const [field, incoming] of Object.entries(op.fields)) {
+          if (field === 'updatedAt' || field === 'createdAt' || field === 'id' || field === 'experiences') continue;
+          const baseValue = op.base[field];
+          if (baseValue === undefined) continue;
+          const currentValue = (bench as unknown as Record<string, unknown>)[field];
+          if (currentValue !== baseValue && currentValue !== incoming) {
+            collisions.push({
+              benchId: op.benchId,
+              field,
+              baseValue,
+              droppedValue: currentValue,
+              keptValue: incoming,
+              at: entry.at,
+              version: entry.version,
+            });
+          }
+        }
+      }
       state = applyDirectOps(state, entry.ops);
     } else if (entry.type === 'revoke') {
       continue;
@@ -428,7 +454,7 @@ export function foldJournal(
     }
   }
 
-  return { benches: state, outcomes };
+  return { benches: state, outcomes, collisions };
 }
 
 /** 计算某批次应用条目之前的档案状态（用于被拦下批次的重新对账） */
@@ -462,6 +488,78 @@ export function stateBeforeBatch(
   }
 
   return state;
+}
+
+// ---------------------------------------------------------------------------
+// 跨标签页合并：日志按 id 求并集后重排版本，批次按 id 合并后重排序号
+// ---------------------------------------------------------------------------
+
+/** 合并多个日志：按条目 id 去重，按 (时间, id) 确定性排序，版本号重排为连续序号 */
+export function mergeJournals(
+  ...journals: import('@/types/survey').JournalEntry[][]
+): import('@/types/survey').JournalEntry[] {
+  const byId = new Map<string, import('@/types/survey').JournalEntry>();
+  for (const journal of journals) {
+    journal.forEach((entry, index) => {
+      // 兼容旧数据：没有 id 的条目按原顺序补稳定 id
+      const id =
+        (entry as { id?: string }).id ??
+        `mig-${String(index).padStart(6, '0')}-${entry.type}-${entry.at}`;
+      if (!byId.has(id)) {
+        byId.set(id, { ...entry, id } as import('@/types/survey').JournalEntry);
+      }
+    });
+  }
+  const sorted = [...byId.values()].sort((a, b) => {
+    if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+    if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+    return 0;
+  });
+  // 版本号重排，保证合并后档案版本连续
+  return sorted.map((entry, i) => ({ ...entry, version: i + 1 }));
+}
+
+function batchFreshness(batch: SurveyBatch): string {
+  return batch.updatedAt ?? batch.createdAt;
+}
+
+/** 同 id 批次合并：以较新副本为底，裁决与跳过取两侧并集（状态由日志重放重算） */
+function mergeTwoBatches(x: SurveyBatch, y: SurveyBatch): SurveyBatch {
+  const fx = batchFreshness(x);
+  const fy = batchFreshness(y);
+  let winner = x;
+  let loser = y;
+  if (fy > fx || (fy === fx && JSON.stringify(y) > JSON.stringify(x))) {
+    winner = y;
+    loser = x;
+  }
+  return {
+    ...winner,
+    adjudications: { ...loser.adjudications, ...winner.adjudications },
+    skipped: [...new Set([...loser.skipped, ...winner.skipped])],
+  };
+}
+
+/** 合并批次列表：按 id 求并集（墓碑中的 id 剔除），按 (序号, 创建时间, id) 重排连续序号 */
+export function mergeBatches(
+  local: SurveyBatch[],
+  remote: SurveyBatch[],
+  tombstones: string[] = []
+): SurveyBatch[] {
+  const tomb = new Set(tombstones);
+  const byId = new Map<string, SurveyBatch>();
+  for (const batch of [...local, ...remote]) {
+    if (tomb.has(batch.id)) continue;
+    const existing = byId.get(batch.id);
+    byId.set(batch.id, existing ? mergeTwoBatches(existing, batch) : batch);
+  }
+  const sorted = [...byId.values()].sort((a, b) => {
+    if (a.seq !== b.seq) return a.seq - b.seq;
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+    if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+    return 0;
+  });
+  return sorted.map((batch, i) => ({ ...batch, seq: i + 1 }));
 }
 
 // ---------------------------------------------------------------------------
