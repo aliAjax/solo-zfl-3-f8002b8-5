@@ -1,5 +1,5 @@
 import { useLocation, useNavigate } from 'react-router-dom';
-import { MapPin, List, Trophy, Plus, TreeDeciduous } from 'lucide-react';
+import { MapPin, List, Trophy, Plus, TreeDeciduous, ClipboardList } from 'lucide-react';
 
 export default function Navbar() {
   const location = useLocation();
@@ -9,6 +9,7 @@ export default function Navbar() {
     { path: '/', icon: List, label: '列表' },
     { path: '/map', icon: MapPin, label: '地图' },
     { path: '/ranking', icon: Trophy, label: '排行' },
+    { path: '/survey', icon: ClipboardList, label: '勘测批次' },
   ];
 
   const isActive = (path: string) => {
